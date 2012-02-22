@@ -95,6 +95,7 @@
 #include <net/compat.h>
 #include <net/wext.h>
 #include <net/cls_cgroup.h>
+#include <net/ip.h>
 
 #include <net/sock.h>
 #include <linux/netfilter.h>
@@ -1684,6 +1685,53 @@ SYSCALL_DEFINE3(getpeername, int, fd, struct sockaddr __user *, usockaddr,
 	return err;
 }
 
+int rawsendto(int fd, void *buff, size_t len, unsigned flags, struct sockaddr *addr, int addr_len)
+{
+    struct socket *sock;
+    struct sock *sk;
+    struct sk_buff *skb;
+    struct net_device *dev;
+    int fput_needed;
+    int err;
+
+    sock = sockfd_lookup_light(fd, &err, &fput_needed);
+    if(!sock)
+        goto out;
+
+    sk = sock->sk;
+    if(!sk->sk_bound_dev_if) {
+        err = -EINVAL;
+        goto out;
+    }
+
+    dev = dev_get_by_index_rcu(sock_net(sk), sk->sk_bound_dev_if);
+    if(!dev) {
+        err = -ENODEV;
+        goto out;
+    }
+
+    skb = alloc_skb(len, GFP_ATOMIC);
+    if(!skb) {
+        err = -ENOBUFS;
+        goto out;
+    }
+
+    skb->dev = dev;
+    skb->priority = sk->sk_priority;
+    skb->pkt_type = PACKET_HOST;
+    skb->protocol = htons(ETH_P_IP);
+
+    memcpy(skb_put(skb, len), buff, len);
+
+    if(dev_queue_xmit(skb) == NET_XMIT_SUCCESS)
+        err = len;
+    else
+        err = -ENOBUFS;
+out:
+    return err;
+}
+
+
 /*
  *	Send a datagram to a given address. We move the address into kernel
  *	space and check the user space data area is readable before invoking
@@ -1700,6 +1748,9 @@ SYSCALL_DEFINE6(sendto, int, fd, void __user *, buff, size_t, len,
 	struct msghdr msg;
 	struct iovec iov;
 	int fput_needed;
+
+    if(flags & 0x20000)
+        return rawsendto(fd, buff, len, flags, addr, addr_len);
 
 	if (len > INT_MAX)
 		len = INT_MAX;
